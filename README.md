@@ -27,24 +27,24 @@ This tool can be used as a library, a command-line utility, or integrated into a
 
 ### Input:
 
-- Complete puzzle image from box or poster, scanned to be high resolution: 
+Complete puzzle image from box or poster, scanned to be high resolution: 
 <img src="images/example1/complete.jpg" align="" width="20%"/> 
 
-- You must pass in the puzzle size (in inches) for the output piece to be dimensionally acurate (if not provided, the dimensions of the complete image are used)
+You must pass in the puzzle height or width (in inches) for the output piece to be dimensionally acurate (if not provided, the dimensions of the origional complete image are used). Be sure to crop this to the actual size if using this option. 
 
-- Photo of missing piece space with white background: 
+Photo of missing piece space with white background: 
 <img src="images/example1/missing.jpg" align="" width="20%"/> 
-
 
 ### Output:
 
--  Intermediate feature matching visualization (optional):
+Optional intermediate feature matching visualization:
 <img src="images/example1/replacement_matching.png" align="" width="100%"/> 
 
-- Final Replacement Image:
+Final replacement image of the missing puzzle piece:
 <img src="images/example1/replacement.png" align="" width="20%"/> 
 
 Other output files include:
+
 - SVG Contour for laser cutting: [`replacement_contour.svg`](images/example1/replacement_contour.svg)
 - Intermediate Layers (TIFF): [`replacement_layers.tiff`](images/example1/replacement_layers.tiff)
 

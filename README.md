@@ -237,3 +237,5 @@ The script's core capabilities include:
 - **Intermediate Output**: Provides an option to save intermediate aligned images in a multi-layered TIFF format for debugging and analysis.
 - **SVG Contour Export**: Allows exporting the aligned outline of the white region as an SVG file.
 
+developed here: https://colab.research.google.com/drive/1OBu8oIlKacJUXDw7GvjsRBLrmqtpoLnu?usp=drive_link
+

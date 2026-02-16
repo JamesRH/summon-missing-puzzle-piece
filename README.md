@@ -1,47 +1,52 @@
-# summon-missing-puzzle-piece <a href="https://github.com/JamesRH/summon-missing-puzzle-piece"> <img src="https://raw.githubusercontent.com/JamesRH/summon-missing-puzzle-piece/main/images/logo.png"  align="right" height="250"/></a>
-
-
+# summon-missing-puzzle-piece <a href="https://github.com/JamesRH/summon-missing-puzzle-piece"> <img src="https://raw.githubusercontent.com/JamesRH/summon-missing-puzzle-piece/main/images/logo.png"  align="left" height="250"/></a>
 
 <!-- badges: start -->
 ![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)
 ![Python 3.6](https://img.shields.io/badge/python-3.6-blue.svg)
 
-![Google Gemini](https://img.shields.io/badge/google%20gemini-8E75B2?style=for-the-badge&logo=google%20gemini&logoColor=white) 
-🤖 Vibe Coded!
 <!-- badges: end -->
-
 
 **Don't you hate it when a puzzle is missing a piece?**
 
-Try out this OpenCV script that uses a photo of a nearly-complete puzzle missing a piece + a scan of the puzzle box / poster to generate a dimenionally accurate replacement puzzle piece image and svg outline (for laser cutting). 
+Use a photo of a nearly-complete puzzle missing a piece + a scan of the puzzle box / poster to generate a dimenionally accurate replacement puzzle piece image to print out and svg outline (for laser cutting). 
 
-Heavily vibe coded in a single 3 hour session, may not function as intended. 
-
-by @jamerh and gemini
+by @jamerh and gemini. 🤖 Vibe coded, very rough but runs. 
 
 ![workflow](images/visual.jpg)
 
-This tool can be used as a library, a command-line utility, or integrated into a cross-platform GUI.
+This tool can be used as a library, a command-line utility, or integrated into a cross-platform GUI [under development]. Uses OpenCV under the hood. Made to help keep puzzles in circulation at a local puzzle library. 
 
 ## Example
 
 ### Input:
 
 Complete puzzle image from box or poster, scanned to be high resolution: 
+
+<figure>
 <img src="images/example1/complete.jpg" align="" width="20%"/> 
+</figure>
 
 You must pass in the puzzle height or width (in inches) for the output piece to be dimensionally acurate (if not provided, the dimensions of the origional complete image are used). Be sure to crop this to the actual size if using this option. 
 
 Photo of missing piece space with white background: 
+
+<figure>
 <img src="images/example1/missing.jpg" align="" width="20%"/> 
+</figure>
 
 ### Output:
 
 Optional intermediate feature matching visualization:
+
+<figure>
 <img src="images/example1/replacement_matching.png" align="" width="100%"/> 
+</figure>
 
 Final replacement image of the missing puzzle piece:
+
+<figure>
 <img src="images/example1/replacement.png" align="" width="20%"/> 
+</figure>
 
 Other output files include:
 

@@ -86,7 +86,7 @@ class ImageAligner:
 
         return dark_lines_mask
 
-    def process(self, complete_image_path, missing_image_path, output_path, save_intermediate=False, show_matches=False, draw_contours=False, save_svg_contour=False, print_width_inches=None, print_height_inches=None):
+    def process(self, complete_image_path, missing_image_path, output_path, save_intermediate=False, show_matches=False, draw_contours=False, save_svg_contour=False, puzzle_width_inches=None, puzzle_height_inches=None):
         """
         Main pipeline function.
         """
@@ -114,7 +114,6 @@ class ImageAligner:
             plt.title("Missing Image (Original)")
             plt.axis('off')
             plt.show()
-
         # Find white region in missing_image and make it transparent
         white_region_mask = self._find_white_region(missing_image)
         missing_image[white_region_mask == 255, 3] = 0
@@ -215,7 +214,9 @@ class ImageAligner:
         if save_svg_contour:
             svg_filename = os.path.splitext(output_path)[0] + "_contour.svg"
             # Use explicit pixel units for size and correct (width, height) order
-            dwg = svgwrite.Drawing(svg_filename, size=(f"{w}px", f"{h}px"), profile='tiny') # Use cropped dimensions
+            
+            dwg = svgwrite.Drawing(svg_filename, size=(f"{w}px", f"{h}px"), profile='tiny', 
+                                   height=puzzle_hight_inches+'in', width=puzzle_width_inches+'20in') # Use cropped dimensions
 
             # Simplify the contour using approxPolyDP
             # We use the contours found above, which are already from aligned_white_mask and CHAIN_APPROX_NONE
@@ -239,44 +240,57 @@ class ImageAligner:
             if self.debug:
                 print(f"SVG contour saved to {svg_filename}")
 
+
+        # Change print size by munging dpi
         # Get DPI information from original complete image
-        # Calculate DPI based on print_width_inches/print_height_inches if provided, else use original or default
-        if print_width_inches is not None or print_height_inches is not None:
-            # Use dimensions of the uncropped image for accurate aspect ratio and DPI calculation
-            w_pixels, h_pixels = final_output_uncropped.shape[1], final_output_uncropped.shape[0]
-            current_aspect_ratio = w_pixels / h_pixels
-            calculated_dpi = None
+        # Calculate DPI based on puzzle_width_inches/puzzle_height_inches if provided, else use original or default
+        pil_complete_image_info = Image.open(complete_image_path).info
+        dpi = pil_complete_image_info.get('dpi', (300, 300))
+        # Use dimensions of the uncropped image for accurate aspect ratio and DPI calculation
+        w_pixels, h_pixels = final_output_uncropped.shape[1], final_output_uncropped.shape[0]
+        current_aspect_ratio = w_pixels / h_pixels
+        # Calculate size in inches
+        current_width_inches = w_pixels / dpi[0]
+        current_height_inches = h_pixels / dpi[1]
+    
+            
+        if puzzle_width_inches is None and puzzle_height_inches is None:    
+            calculated_dpi = dpi
+            puzzle_width_inches = current_width_inches
+            puzzle_height_inches = current_height_in
+            
+        elif puzzle_width_inches is not None and puzzle_height_inches is not None:
+            provided_aspect_ratio = puzzle_width_inches / puzzle_height_inches
+            # Allow for slight floating point inaccuracies
+            if not np.isclose(current_aspect_ratio, provided_aspect_ratio, atol=0.01):
+                raise ValueError(
+                    f"Provided print dimensions ({puzzle_width_inches}in x {puzzle_height_inches}in) "
+                    f"do not match the image's aspect ratio ({current_aspect_ratio:.2f}). "
+                    "Please provide only one dimension (width or height) or ensure aspect ratios match."
+                )
+            # If aspect ratios match, calculate DPI using width
+            target_dpi = w_pixels / puzzle_width_inches
+            calculated_dpi = (int(target_dpi), int(target_dpi))
+            if self.debug: print(f"Calculated DPI for {puzzle_width_inches}in x {puzzle_height_inches}in: {calculated_dpi[0]}")
 
-            if print_width_inches is not None and print_height_inches is not None:
-                provided_aspect_ratio = print_width_inches / print_height_inches
-                # Allow for slight floating point inaccuracies
-                if not np.isclose(current_aspect_ratio, provided_aspect_ratio, atol=0.01):
-                    raise ValueError(
-                        f"Provided print dimensions ({print_width_inches}in x {print_height_inches}in) "
-                        f"do not match the image's aspect ratio ({current_aspect_ratio:.2f}). "
-                        "Please provide only one dimension (width or height) or ensure aspect ratios match."
-                    )
-                # If aspect ratios match, calculate DPI using width
-                target_dpi = w_pixels / print_width_inches
-                calculated_dpi = (int(target_dpi), int(target_dpi))
-                if self.debug: print(f"Calculated DPI for {print_width_inches}in x {print_height_inches}in: {calculated_dpi[0]}")
-            elif print_width_inches is not None:
-                target_dpi = w_pixels / print_width_inches
-                calculated_dpi = (int(target_dpi), int(target_dpi))
-                if self.debug: print(f"Calculated DPI for {print_width_inches} inches width: {calculated_dpi[0]}")
-            elif print_height_inches is not None:
-                target_dpi = h_pixels / print_height_inches
-                calculated_dpi = (int(target_dpi), int(target_dpi))
-                if self.debug: print(f"Calculated DPI for {print_height_inches} inches height: {calculated_dpi[0]}")
+        elif puzzle_width_inches is not None:
+            target_dpi = w_pixels / puzzle_width_inches
+            calculated_dpi = (int(target_dpi), int(target_dpi))
+            puzzle_hight_inches = current_hight_inches * ( puzzle_width_inches / current_width_inches ) 
+            if self.debug: print(f"Calculated DPI for {puzzle_width_inches} inches width: {calculated_dpi[0]}")
 
-            dpi = calculated_dpi if calculated_dpi is not None else (300, 300) # Fallback if error occurs, though should be caught
+        elif puzzle_height_inches is not None:
+            target_dpi = h_pixels / puzzle_height_inches
+            calculated_dpi = (int(target_dpi), int(target_dpi))
+            puzzle_width_inches = current_width_inches * ( puzzle_height_inches / current_height_inches )
+            if self.debug: print(f"Calculated DPI for {puzzle_height_inches} inches height: {calculated_dpi[0]}")
         else:
-            pil_complete_image_info = Image.open(complete_image_path).info
-            dpi = pil_complete_image_info.get('dpi', (300, 300))
+            calculated_dpi=dpi if dpi is not None else (300, 300) # Fallback if error occurs, though should be caught
+
 
         # Save the final output PNG
         final_pil = Image.fromarray(cv2.cvtColor(final_output, cv2.COLOR_BGRA2RGBA))
-        final_pil.save(output_path, "PNG", dpi=dpi)
+        final_pil.save(output_path, "PNG", dpi=calculated_dpi)
 
         if save_intermediate:
             inter_path = os.path.splitext(output_path)[0] + "_layers.tiff"
@@ -284,7 +298,7 @@ class ImageAligner:
             pil_missing_image = Image.fromarray(cv2.cvtColor(aligned_missing_image, cv2.COLOR_BGRA2RGBA))
             # Add the new final_output as the third layer (making it the 4th layer overall)
             pil_final_output_layer = Image.fromarray(cv2.cvtColor(final_output_uncropped, cv2.COLOR_BGRA2RGBA)) # Use uncropped version
-            pil_complete_image.save(inter_path, format="TIFF", save_all=True, append_images=[pil_missing_image, pil_final_output_layer], dpi=dpi)
+            pil_complete_image.save(inter_path, format="TIFF", save_all=True, append_images=[pil_missing_image, pil_final_output_layer], dpi=calculated_dpi)
 
         return complete_image, missing_image, final_output
 
@@ -303,8 +317,8 @@ def main():
     parser.add_argument('--draw_contours', action='store_true', help='Draw a red 1px outline around the replaced region in the final output.')
     parser.add_argument('--save_svg_contour', action='store_true', help='Save the aligned contour of the white region as an SVG file.')
     parser.add_argument('--debug', action='store_true', help='Enable debug prints for diagnostic information.')
-    parser.add_argument('--print_width_inches', type=float, help='Desired physical print width of the output image in inches. DPI will be calculated to match this width, preserving aspect ratio.')
-    parser.add_argument('--print_height_inches', type=float, help='Desired physical print height of the output image in inches. DPI will be calculated to match this height, preserving aspect ratio.')
+    parser.add_argument('--puzzle_width_inches', type=float, help='Desired piece scaling for width of the puzzle in inches. DPI will be calculated to match this width, preserving aspect ratio.')
+    parser.add_argument('--puzzle_height_inches', type=float, help='Desired piece scaling for height of the puzzle in inches. DPI will be calculated to match this height, preserving aspect ratio.')
 
     args = parser.parse_args()
 
@@ -354,8 +368,8 @@ def main():
                         show_matches=args.show_matches,
                         draw_contours=args.draw_contours,
                         save_svg_contour=args.save_svg_contour,
-                        print_width_inches=args.print_width_inches,
-                        print_height_inches=args.print_height_inches
+                        puzzle_width_inches=args.puzzle_width_inches,
+                        puzzle_height_inches=args.puzzle_height_inches
                     )
                     print(f"Successfully processed '{subdir_name}'. Output saved to '{batch_output_path}'.")
                     processed_count += 1
@@ -386,8 +400,8 @@ def main():
                 show_matches=args.show_matches,
                 draw_contours=args.draw_contours,
                 save_svg_contour=args.save_svg_contour,
-                print_width_inches=args.print_width_inches,
-                print_height_inches=args.print_height_inches
+                puzzle_width_inches=args.puzzle_width_inches,
+                puzzle_height_inches=args.puzzle_height_inches
             )
 
             if aligner.debug and args.show_matches:
@@ -403,7 +417,7 @@ def main():
             if args.save_svg_contour:
                 outputs.append(f"'{os.path.splitext(args.output_path)[0] + '_contour.svg'}'")
 
-            print(f"Success! Images processed. You can download {', '.join(outputs)} from the files menu.")
+            print(f"Success! Images processed. Saved at {', '.join(outputs)}")
         else:
             print("Please ensure both input image files exist at the specified paths.")
     except Exception as e:

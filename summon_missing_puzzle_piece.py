@@ -248,8 +248,19 @@ class ImageAligner:
             svg_filename = os.path.splitext(output_path)[0] + "_contour.svg"
             # Use explicit pixel units for size and correct (width, height) order
             
-            dwg = svgwrite.Drawing(svg_filename, size=(f"{w}px", f"{h}px"), profile='tiny', 
-                                   height=puzzle_hight_inches+'in', width=puzzle_width_inches+'20in') # Use cropped dimensions
+            dwg = svgwrite.Drawing(svg_filename, size=(f"{w}px", f"{h}px"), profile='tiny')
+            if puzzle_width_inches is not None:
+                svg_width_inches = puzzle_width_inches
+                svg_height_inches = puzzle_height_inches if puzzle_height_inches is not None else (puzzle_width_inches * h / w if w != 0 else None)
+            elif puzzle_height_inches is not None:
+                svg_height_inches = puzzle_height_inches
+                svg_width_inches = puzzle_height_inches * w / h if h != 0 else None
+            else:
+                svg_width_inches = None
+                svg_height_inches = None
+            if svg_width_inches is not None and svg_height_inches is not None:
+                dwg['width'] = f"{svg_width_inches}in"
+                dwg['height'] = f"{svg_height_inches}in"
 
             # Simplify the contour using approxPolyDP
             # We use the contours found above, which are already from aligned_white_mask and CHAIN_APPROX_NONE

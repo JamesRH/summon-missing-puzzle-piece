@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import svgwrite # Added for SVG output
 import argparse # Added for CLI functionality
 import sys # Added for mocking sys.argv
+from scipy.ndimage import gaussian_filter1d
 
 class ImageAligner:
     """
@@ -34,8 +35,9 @@ class ImageAligner:
         hsv = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR)
         hsv = cv2.cvtColor(hsv, cv2.COLOR_BGR2HSV)
 
+        # Saturation threshold of 60 also captures light blue grid lines (S≈15–50)
         lower_white = np.array([0, 0, 200], dtype=np.uint8)
-        upper_white = np.array([180, 50, 255], dtype=np.uint8)
+        upper_white = np.array([180, 60, 255], dtype=np.uint8)
         white_mask = cv2.inRange(hsv, lower_white, upper_white)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -86,7 +88,143 @@ class ImageAligner:
 
         return dark_lines_mask
 
-    def process(self, complete_image_path, missing_image_path, output_path, save_intermediate=False, show_matches=False, draw_contours=False, save_svg_contour=False, puzzle_width_inches=None, puzzle_height_inches=None):
+    def _detect_grid_angle(self, img_bgr, white_mask):
+        """
+        Detect the rotation angle of a light-blue grid in the white region.
+        Uses Hough line detection on a CLAHE-enhanced saturation channel.
+        Returns the deviation from horizontal in degrees.
+        """
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        v_ch = hsv[:, :, 2]
+        s_ch = hsv[:, :, 1]
+
+        paper_pixels = ((v_ch > 175) & (white_mask > 0)).astype(np.uint8) * 255
+        s_masked = (s_ch * (paper_pixels > 0)).astype(np.uint8)
+
+        clahe = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(8, 8))
+        s_enhanced = clahe.apply(s_masked)
+
+        edges = cv2.Canny(s_enhanced, 5, 30)
+        edges = cv2.bitwise_and(edges, paper_pixels)
+
+        lines = cv2.HoughLines(edges, 1, np.pi / 360, threshold=20)
+        if lines is None:
+            return 0.0
+
+        angles_h = []
+        for line in lines:
+            rho, theta = line[0]
+            theta_deg = np.degrees(theta)
+            if 70 < theta_deg < 110:
+                angles_h.append(theta_deg - 90)
+
+        return float(np.median(angles_h)) if angles_h else 0.0
+
+    def _find_grid_spacing(self, img_bgr, white_mask):
+        """
+        Estimate the physical scale of the image by measuring the spacing of a
+        light-blue ¼-inch grid visible inside the white region.
+
+        The method:
+          1. Detects and corrects for slight grid rotation.
+          2. Builds a masked LAB 'b'-channel column profile (paper pixels only).
+          3. Applies a Gaussian high-pass filter and computes the FFT.
+          4. Finds the dominant spatial frequency corresponding to ¼-inch grid lines.
+
+        Returns (pixels_per_inch_x, pixels_per_inch_y).  Either value may be None
+        if the grid is not detectable along that axis.
+        """
+        # --- Step 1: correct for grid rotation ---
+        grid_angle = self._detect_grid_angle(img_bgr, white_mask)
+
+        h_full, w_full = img_bgr.shape[:2]
+        if abs(grid_angle) > 0.2:
+            cx, cy = w_full / 2, h_full / 2
+            M_rot = cv2.getRotationMatrix2D((cx, cy), grid_angle, 1.0)
+            img_rot = cv2.warpAffine(img_bgr, M_rot, (w_full, h_full),
+                                     flags=cv2.INTER_LINEAR)
+            mask_rot = cv2.warpAffine(white_mask.astype(np.float32), M_rot,
+                                      (w_full, h_full))
+            mask_rot = (mask_rot > 0.5).astype(np.uint8) * 255
+        else:
+            img_rot = img_bgr
+            mask_rot = white_mask
+
+        if self.debug:
+            print(f"  Grid rotation angle: {grid_angle:.2f}°")
+
+        # --- Step 2: build masked LAB 'b'-channel profiles ---
+        lab = cv2.cvtColor(img_rot, cv2.COLOR_BGR2Lab)
+        hsv_rot = cv2.cvtColor(img_rot, cv2.COLOR_BGR2HSV)
+        b_lab = lab[:, :, 2].astype(np.float32) - 128   # negative = blue, positive = yellow
+        v_rot = hsv_rot[:, :, 2].astype(np.float32)
+
+        coords = cv2.findNonZero(mask_rot)
+        if coords is None:
+            return None, None
+        px, py, pw, ph = cv2.boundingRect(coords)
+
+        local_b = b_lab[py:py + ph, px:px + pw]
+        local_v = v_rot[py:py + ph, px:px + pw]
+        local_mask = mask_rot[py:py + ph, px:px + pw]
+        # Paper pixels: bright and inside the white region
+        paper = (local_v > 175) & (local_mask > 0)
+
+        def _build_profile(axis):
+            """Average b_lab values along axis, restricted to paper pixels."""
+            n = local_b.shape[axis]
+            profile = np.full(n, np.nan)
+            for i in range(n):
+                pix = paper[:, i] if axis == 1 else paper[i, :]
+                if pix.sum() > 5:
+                    vals = local_b[pix, i] if axis == 1 else local_b[i, pix]
+                    profile[i] = float(vals.mean())
+            return profile
+
+        # --- Step 3: FFT-based period estimation ---
+        def _ppi_from_profile(profile):
+            """
+            Apply Gaussian high-pass filter then find the dominant FFT period
+            in the range 8–65 pixels (covers ¼-inch grids from ~32 to ~260 DPI).
+            Returns pixels-per-inch or None.
+            """
+            valid = ~np.isnan(profile)
+            if valid.sum() < 15:
+                return None
+            vidx = np.where(valid)[0]
+            interp = np.interp(np.arange(len(profile)), vidx, profile[valid])
+
+            # High-pass: subtract slow background trend (lighting gradient)
+            lf = gaussian_filter1d(interp, sigma=20)
+            residual = interp - lf
+
+            fft_vals = np.fft.rfft(residual)
+            power = np.abs(fft_vals) ** 2
+            freqs = np.fft.rfftfreq(len(residual))
+
+            # Search for dominant period in the range [8, 65] pixels
+            valid_f = (freqs > 1.0 / 65) & (freqs < 1.0 / 8)
+            if not valid_f.any():
+                return None
+
+            best_idx = np.argmax(power[valid_f])
+            best_freq = freqs[valid_f][best_idx]
+            quarter_inch_pixels = 1.0 / best_freq   # pixels per ¼ inch
+            return quarter_inch_pixels * 4           # pixels per inch
+
+        x_ppi = _ppi_from_profile(_build_profile(axis=1))  # vertical grid lines
+        y_ppi = _ppi_from_profile(_build_profile(axis=0))  # horizontal grid lines
+
+        if self.debug:
+            print(f"  Grid spacing — X: {f'{x_ppi:.1f}' if x_ppi else 'n/a'} px/in, "
+                  f"Y: {f'{y_ppi:.1f}' if y_ppi else 'n/a'} px/in")
+
+        return x_ppi, y_ppi
+
+    def process(self, complete_image_path, missing_image_path, output_path,
+                save_intermediate=False, show_matches=False, draw_contours=False,
+                save_svg_contour=False, puzzle_width_inches=None,
+                puzzle_height_inches=None, use_grid=False):
         """
         Main pipeline function.
         """
@@ -114,8 +252,24 @@ class ImageAligner:
             plt.title("Missing Image (Original)")
             plt.axis('off')
             plt.show()
-        # Find white region in missing_image and make it transparent
+        # Find white region in missing_image
         white_region_mask = self._find_white_region(missing_image)
+
+        # If --grid is set, measure the ¼-inch grid spacing BEFORE transparency is applied
+        grid_ppi_missing = None
+        if use_grid:
+            missing_image_bgr = cv2.cvtColor(missing_image, cv2.COLOR_BGRA2BGR)
+            grid_x, grid_y = self._find_grid_spacing(missing_image_bgr, white_region_mask)
+            candidates = [p for p in (grid_x, grid_y) if p is not None]
+            if candidates:
+                grid_ppi_missing = float(np.mean(candidates))
+                if self.debug:
+                    print(f"Grid-derived pixels/inch in missing image: {grid_ppi_missing:.1f}")
+            else:
+                if self.debug:
+                    print("Warning: --grid specified but no grid detected; falling back to default DPI.")
+
+        # Make the white region transparent
         missing_image[white_region_mask == 255, 3] = 0
 
         # Find dark lines in missing_image
@@ -252,9 +406,19 @@ class ImageAligner:
         # Calculate size in inches
         current_width_inches = w_pixels / dpi[0]
         current_height_inches = h_pixels / dpi[1]
+
+        if use_grid and grid_ppi_missing is not None:
+            # Scale the missing-image grid DPI to the complete image using the affine transform.
+            # The affine scale k maps 1 pixel in the missing image to k pixels in the complete image,
+            # so pixels-per-inch in the complete image = k * pixels-per-inch in the missing image.
+            k = float(np.sqrt(matrix[0, 0] ** 2 + matrix[0, 1] ** 2))
+            grid_dpi = int(round(k * grid_ppi_missing))
+            calculated_dpi = (grid_dpi, grid_dpi)
+            if self.debug:
+                print(f"Affine scale k={k:.4f}, grid DPI={grid_dpi}")
     
             
-        if puzzle_width_inches is None and puzzle_height_inches is None:    
+        elif puzzle_width_inches is None and puzzle_height_inches is None:    
             calculated_dpi = dpi
             puzzle_width_inches = current_width_inches
             puzzle_height_inches = current_height_in
@@ -319,6 +483,7 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable debug prints for diagnostic information.')
     parser.add_argument('--puzzle_width_inches', type=float, help='Desired piece scaling for width of the puzzle in inches. DPI will be calculated to match this width, preserving aspect ratio.')
     parser.add_argument('--puzzle_height_inches', type=float, help='Desired piece scaling for height of the puzzle in inches. DPI will be calculated to match this height, preserving aspect ratio.')
+    parser.add_argument('--grid', action='store_true', help='Scale output by detecting the ¼-inch light-blue grid in the white region of the missing image.')
 
     args = parser.parse_args()
 
@@ -369,7 +534,8 @@ def main():
                         draw_contours=args.draw_contours,
                         save_svg_contour=args.save_svg_contour,
                         puzzle_width_inches=args.puzzle_width_inches,
-                        puzzle_height_inches=args.puzzle_height_inches
+                        puzzle_height_inches=args.puzzle_height_inches,
+                        use_grid=args.grid
                     )
                     print(f"Successfully processed '{subdir_name}'. Output saved to '{batch_output_path}'.")
                     processed_count += 1
@@ -401,7 +567,8 @@ def main():
                 draw_contours=args.draw_contours,
                 save_svg_contour=args.save_svg_contour,
                 puzzle_width_inches=args.puzzle_width_inches,
-                puzzle_height_inches=args.puzzle_height_inches
+                puzzle_height_inches=args.puzzle_height_inches,
+                use_grid=args.grid
             )
 
             if aligner.debug and args.show_matches:

@@ -28,27 +28,54 @@ class ImageAligner:
 
     def _find_white_region(self, img_bgra):
         """
-        Finds the largest white region, ignoring noise and damaged lines.
-        Returns a binary mask of the white area.
+        Finds the largest white region.  Calls _find_region with region_color='white'.
+        Retained for backwards compatibility.
         """
-        hsv = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR)
-        hsv = cv2.cvtColor(hsv, cv2.COLOR_BGR2HSV)
+        return self._find_region(img_bgra, region_color='white')
 
-        lower_white = np.array([0, 0, 200], dtype=np.uint8)
-        upper_white = np.array([180, 50, 255], dtype=np.uint8)
-        white_mask = cv2.inRange(hsv, lower_white, upper_white)
+    def _find_region(self, img_bgra, region_color='white'):
+        """
+        Finds the largest region of a given color in the image.
+        Supports region_color values: 'white', 'black', 'green'.
+        The 'green' color targets #67c885 and accommodates shadow variation
+        from approximately #51613d (dark shadow) to #66cc83 (lit areas).
+        Returns a binary mask of the detected area.
+        """
+        bgr = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+        color_ranges = {
+            'white': (np.array([0,   0, 200], dtype=np.uint8),
+                      np.array([180, 50, 255], dtype=np.uint8)),
+            'black': (np.array([0,   0,   0], dtype=np.uint8),
+                      np.array([180, 255, 50], dtype=np.uint8)),
+            # Covers #67c885 including shadows (#51613d–#66cc83)
+            'green': (np.array([35,  40,  40], dtype=np.uint8),
+                      np.array([90, 200, 240], dtype=np.uint8)),
+        }
+
+        if region_color not in color_ranges:
+            raise ValueError(
+                f"Unsupported region_color '{region_color}'. "
+                f"Choose from: {list(color_ranges.keys())}"
+            )
+
+        lower, upper = color_ranges[region_color]
+        color_mask = cv2.inRange(hsv, lower, upper)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            raise ValueError("Could not find any white area in the second image.")
+            raise ValueError(
+                f"Could not find any {region_color} area in the missing image."
+            )
 
         largest_contour = max(contours, key=cv2.contourArea)
 
-        clean_mask = np.zeros_like(white_mask)
+        clean_mask = np.zeros_like(color_mask)
         cv2.drawContours(clean_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
 
         return clean_mask
@@ -86,7 +113,7 @@ class ImageAligner:
 
         return dark_lines_mask
 
-    def process(self, complete_image_path, missing_image_path, output_path, save_intermediate=False, show_matches=False, draw_contours=False, save_svg_contour=False, puzzle_width_inches=None, puzzle_height_inches=None):
+    def process(self, complete_image_path, missing_image_path, output_path, save_intermediate=False, show_matches=False, draw_contours=False, save_svg_contour=False, puzzle_width_inches=None, puzzle_height_inches=None, region_color='white'):
         """
         Main pipeline function.
         """
@@ -114,8 +141,8 @@ class ImageAligner:
             plt.title("Missing Image (Original)")
             plt.axis('off')
             plt.show()
-        # Find white region in missing_image and make it transparent
-        white_region_mask = self._find_white_region(missing_image)
+        # Find the target color region in missing_image and make it transparent
+        white_region_mask = self._find_region(missing_image, region_color=region_color)
         missing_image[white_region_mask == 255, 3] = 0
 
         # Find dark lines in missing_image
@@ -257,7 +284,7 @@ class ImageAligner:
         if puzzle_width_inches is None and puzzle_height_inches is None:    
             calculated_dpi = dpi
             puzzle_width_inches = current_width_inches
-            puzzle_height_inches = current_height_in
+            puzzle_height_inches = current_height_inches
             
         elif puzzle_width_inches is not None and puzzle_height_inches is not None:
             provided_aspect_ratio = puzzle_width_inches / puzzle_height_inches
@@ -276,7 +303,7 @@ class ImageAligner:
         elif puzzle_width_inches is not None:
             target_dpi = w_pixels / puzzle_width_inches
             calculated_dpi = (int(target_dpi), int(target_dpi))
-            puzzle_hight_inches = current_hight_inches * ( puzzle_width_inches / current_width_inches ) 
+            puzzle_height_inches = current_height_inches * ( puzzle_width_inches / current_width_inches ) 
             if self.debug: print(f"Calculated DPI for {puzzle_width_inches} inches width: {calculated_dpi[0]}")
 
         elif puzzle_height_inches is not None:
@@ -319,6 +346,8 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable debug prints for diagnostic information.')
     parser.add_argument('--puzzle_width_inches', type=float, help='Desired piece scaling for width of the puzzle in inches. DPI will be calculated to match this width, preserving aspect ratio.')
     parser.add_argument('--puzzle_height_inches', type=float, help='Desired piece scaling for height of the puzzle in inches. DPI will be calculated to match this height, preserving aspect ratio.')
+    parser.add_argument('--region_color', type=str, default='white', choices=['white', 'black', 'green'],
+                        help="Color of the missing-piece region to detect. 'white' (default), 'black', or 'green' (#67c885, tolerates shadow variation).")
 
     args = parser.parse_args()
 
@@ -369,7 +398,8 @@ def main():
                         draw_contours=args.draw_contours,
                         save_svg_contour=args.save_svg_contour,
                         puzzle_width_inches=args.puzzle_width_inches,
-                        puzzle_height_inches=args.puzzle_height_inches
+                        puzzle_height_inches=args.puzzle_height_inches,
+                        region_color=args.region_color
                     )
                     print(f"Successfully processed '{subdir_name}'. Output saved to '{batch_output_path}'.")
                     processed_count += 1
@@ -401,7 +431,8 @@ def main():
                 draw_contours=args.draw_contours,
                 save_svg_contour=args.save_svg_contour,
                 puzzle_width_inches=args.puzzle_width_inches,
-                puzzle_height_inches=args.puzzle_height_inches
+                puzzle_height_inches=args.puzzle_height_inches,
+                region_color=args.region_color
             )
 
             if aligner.debug and args.show_matches:

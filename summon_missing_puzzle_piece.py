@@ -26,32 +26,54 @@ class ImageAligner:
         else:
             self.matcher = matcher
 
+    def _find_region_mask(self, img_bgra, color='white'):
+        """
+        Finds the largest region of the specified color, ignoring noise and damaged lines.
+        Supported colors: 'white', 'black', 'green'.
+        Returns a binary mask of the detected area.
+        """
+        bgr = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+        if color == 'white':
+            lower = np.array([0, 0, 200], dtype=np.uint8)
+            upper = np.array([180, 50, 255], dtype=np.uint8)
+        elif color == 'black':
+            # Very dark region (V < 80 in any hue/saturation) covers black backgrounds
+            # including slight color variation and JPEG compression artifacts
+            lower = np.array([0, 0, 0], dtype=np.uint8)
+            upper = np.array([180, 255, 80], dtype=np.uint8)
+        elif color == 'green':
+            # #67c885 green with shadow variation from #51613d to #66cc83
+            # Measured HSV range: H=43-69, S=95-128, V=97-204; extra margin applied
+            lower = np.array([35, 70, 70], dtype=np.uint8)
+            upper = np.array([80, 160, 220], dtype=np.uint8)
+        else:
+            raise ValueError(f"Unsupported color '{color}'. Choose from 'white', 'black', or 'green'.")
+
+        mask = cv2.inRange(hsv, lower, upper)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            raise ValueError(f"Could not find any {color} area in the second image.")
+
+        largest_contour = max(contours, key=cv2.contourArea)
+
+        clean_mask = np.zeros_like(mask)
+        cv2.drawContours(clean_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+
+        return clean_mask
+
     def _find_white_region(self, img_bgra):
         """
         Finds the largest white region, ignoring noise and damaged lines.
         Returns a binary mask of the white area.
         """
-        hsv = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR)
-        hsv = cv2.cvtColor(hsv, cv2.COLOR_BGR2HSV)
-
-        lower_white = np.array([0, 0, 200], dtype=np.uint8)
-        upper_white = np.array([180, 50, 255], dtype=np.uint8)
-        white_mask = cv2.inRange(hsv, lower_white, upper_white)
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-        contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            raise ValueError("Could not find any white area in the second image.")
-
-        largest_contour = max(contours, key=cv2.contourArea)
-
-        clean_mask = np.zeros_like(white_mask)
-        cv2.drawContours(clean_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
-
-        return clean_mask
+        return self._find_region_mask(img_bgra, color='white')
 
     def _find_dark_lines_mask(self, img_bgra):
         """
@@ -86,7 +108,7 @@ class ImageAligner:
 
         return dark_lines_mask
 
-    def process(self, complete_image_path, missing_image_path, output_path, save_intermediate=False, show_matches=False, draw_contours=False, save_svg_contour=False, puzzle_width_inches=None, puzzle_height_inches=None):
+    def process(self, complete_image_path, missing_image_path, output_path, save_intermediate=False, show_matches=False, draw_contours=False, save_svg_contour=False, puzzle_width_inches=None, puzzle_height_inches=None, missing_piece_color='white'):
         """
         Main pipeline function.
         """
@@ -114,8 +136,8 @@ class ImageAligner:
             plt.title("Missing Image (Original)")
             plt.axis('off')
             plt.show()
-        # Find white region in missing_image and make it transparent
-        white_region_mask = self._find_white_region(missing_image)
+        # Find the target color region in missing_image and make it transparent
+        white_region_mask = self._find_region_mask(missing_image, color=missing_piece_color)
         missing_image[white_region_mask == 255, 3] = 0
 
         # Find dark lines in missing_image
@@ -124,9 +146,20 @@ class ImageAligner:
         gray_complete_image = cv2.cvtColor(complete_image, cv2.COLOR_BGRA2GRAY)
         gray_missing_image = cv2.cvtColor(missing_image, cv2.COLOR_BGRA2GRAY)
 
-        # Create a valid mask for missing_image features: not transparent AND not dark lines
+        # Create a valid mask for missing_image features: not transparent AND not dark lines.
+        # If removing dark lines leaves too few pixels (e.g. in cropped/zoomed images where
+        # puzzle borders dominate), fall back to using only the transparency mask.
         valid_missing_image_mask = (missing_image[:, :, 3] > 0).astype(np.uint8) * 255
-        valid_missing_image_mask = cv2.bitwise_and(valid_missing_image_mask, cv2.bitwise_not(dark_lines_mask))
+        valid_after_dark_lines = cv2.bitwise_and(valid_missing_image_mask, cv2.bitwise_not(dark_lines_mask))
+        valid_pixels_before = int(valid_missing_image_mask.sum()) // 255
+        valid_pixels_after = int(valid_after_dark_lines.sum()) // 255
+        # Only apply the dark-line exclusion when it retains at least 20% of valid pixels.
+        # Cropped/zoomed images often have puzzle borders covering most of the frame, so
+        # the dark-lines mask would remove too much and leave too few features.
+        if valid_pixels_before > 0 and valid_pixels_after / valid_pixels_before >= 0.20:
+            valid_missing_image_mask = valid_after_dark_lines
+        elif self.debug:
+            print("Dark lines mask removed too many pixels; using transparency mask only.")
 
         # Feature detection
         kp_complete_image, des_complete_image = self.detector.detectAndCompute(gray_complete_image, None)
@@ -257,7 +290,7 @@ class ImageAligner:
         if puzzle_width_inches is None and puzzle_height_inches is None:    
             calculated_dpi = dpi
             puzzle_width_inches = current_width_inches
-            puzzle_height_inches = current_height_in
+            puzzle_height_inches = current_height_inches
             
         elif puzzle_width_inches is not None and puzzle_height_inches is not None:
             provided_aspect_ratio = puzzle_width_inches / puzzle_height_inches
@@ -276,7 +309,7 @@ class ImageAligner:
         elif puzzle_width_inches is not None:
             target_dpi = w_pixels / puzzle_width_inches
             calculated_dpi = (int(target_dpi), int(target_dpi))
-            puzzle_hight_inches = current_hight_inches * ( puzzle_width_inches / current_width_inches ) 
+            puzzle_height_inches = current_height_inches * ( puzzle_width_inches / current_width_inches )
             if self.debug: print(f"Calculated DPI for {puzzle_width_inches} inches width: {calculated_dpi[0]}")
 
         elif puzzle_height_inches is not None:
@@ -302,6 +335,120 @@ class ImageAligner:
 
         return complete_image, missing_image, final_output
 
+# ==========================================
+def verify_result(output_path, correct_path, debug=False):
+    """
+    Verifies the output replacement image against a reference correct image.
+
+    Uses SIFT feature matching across multiple candidate scales (to handle
+    DPI and zoom differences) and all four 90-degree rotations.  Returns
+    the best alignment score found (0–1, higher is better).
+
+    The comparison is made after rescaling ``correct_path`` to match the
+    physical dimensions implied by the output image's DPI metadata, and
+    trying all four 90-degree orientations.  This makes the function robust
+    to the common case where the reference and the generated output differ
+    only in resolution and/or rotation.
+
+    This function is intended as an objective measure for testing the
+    color-region detection without overfitting to any particular output image.
+
+    Parameters
+    ----------
+    output_path : str
+        Path to the generated replacement PNG.
+    correct_path : str
+        Path to the reference correct image (e.g., testcases/correct.jpg).
+    debug : bool
+        If True, print diagnostic information.
+
+    Returns
+    -------
+    float
+        Alignment score in [0, 1].  A score > 0.02 generally indicates
+        a meaningful visual correspondence between the two images.
+    """
+    output_img = cv2.imread(output_path, cv2.IMREAD_UNCHANGED)
+    correct_img = cv2.imread(correct_path, cv2.IMREAD_UNCHANGED)
+
+    if output_img is None or correct_img is None:
+        raise FileNotFoundError(
+            f"Could not load images for verification: '{output_path}', '{correct_path}'"
+        )
+
+    # Convert output to grayscale (composite transparent areas on white)
+    if output_img.ndim == 3 and output_img.shape[2] == 4:
+        alpha = output_img[:, :, 3:4].astype(np.float32) / 255.0
+        rgb = output_img[:, :, :3].astype(np.float32)
+        bg = np.full_like(rgb, 255.0)
+        composited = (rgb * alpha + bg * (1.0 - alpha)).astype(np.uint8)
+        gray_output = cv2.cvtColor(composited, cv2.COLOR_BGR2GRAY)
+    else:
+        gray_output = cv2.cvtColor(output_img, cv2.COLOR_BGR2GRAY)
+
+    if correct_img.ndim == 3 and correct_img.shape[2] == 4:
+        gray_correct_base = cv2.cvtColor(correct_img, cv2.COLOR_BGRA2GRAY)
+    else:
+        gray_correct_base = cv2.cvtColor(correct_img, cv2.COLOR_BGR2GRAY)
+
+    out_h, out_w = gray_output.shape
+
+    detector = cv2.SIFT_create()
+    matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+
+    kp_out, des_out = detector.detectAndCompute(gray_output, None)
+    if des_out is None or len(des_out) < 4:
+        if debug:
+            print("verify_result: not enough features in output image.")
+        return 0.0
+
+    best_score = 0.0
+    best_info = {}
+
+    # Try all four 90-degree rotations and a range of scale factors.
+    # Scale factors span from roughly half to double the output's DPI relative
+    # to the correct image, covering the common 72–300 DPI range spread.
+    cor_h, cor_w = gray_correct_base.shape
+    for rot_k in range(4):
+        rotated = np.rot90(gray_correct_base, k=rot_k)
+        r_h, r_w = rotated.shape
+        # Candidate scales: resize rotated correct to be roughly the same size
+        # as output, trying several nearby scales for robustness.
+        for scale in [0.5, 0.75, 1.0, 1.5, 2.0]:
+            tw = int(out_w * scale)
+            th = int(out_h * scale)
+            if tw < 20 or th < 20:
+                continue
+            resized = cv2.resize(rotated, (tw, th))
+            kp_cor, des_cor = detector.detectAndCompute(resized, None)
+            if des_cor is None or len(des_cor) < 4:
+                continue
+            raw = matcher.knnMatch(des_out, des_cor, k=2)
+            good = [m for m, n in raw if m.distance < 0.80 * n.distance]
+            score = len(good) / max(len(kp_out), len(kp_cor))
+            if score > best_score:
+                best_score = score
+                best_info = {
+                    "rot_deg": rot_k * 90,
+                    "scale": scale,
+                    "good_matches": len(good),
+                    "kp_out": len(kp_out),
+                    "kp_cor": len(kp_cor),
+                }
+
+    if debug:
+        if best_info:
+            print(
+                f"verify_result: best score={best_score:.4f} "
+                f"(rot={best_info['rot_deg']}deg, scale={best_info['scale']}, "
+                f"{best_info['good_matches']} good matches, "
+                f"{best_info['kp_out']} output kpts / {best_info['kp_cor']} correct kpts)"
+            )
+        else:
+            print("verify_result: no usable scale/rotation found.")
+
+    return best_score
+
 # ========================================== # Added main function for CLI
 def main():
     parser = argparse.ArgumentParser(description='Align two images, replacing a white region in the second with a part of the first.')
@@ -319,6 +466,10 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable debug prints for diagnostic information.')
     parser.add_argument('--puzzle_width_inches', type=float, help='Desired piece scaling for width of the puzzle in inches. DPI will be calculated to match this width, preserving aspect ratio.')
     parser.add_argument('--puzzle_height_inches', type=float, help='Desired piece scaling for height of the puzzle in inches. DPI will be calculated to match this height, preserving aspect ratio.')
+    parser.add_argument('--missing_piece_color', type=str, default='white', choices=['white', 'black', 'green'],
+                        help="Color of the missing piece placeholder region in the missing image. "
+                             "Choose 'white' (default), 'black', or 'green' (#67c885 greenscreen, "
+                             "with shadow variation from #51613d to #66cc83).")
 
     args = parser.parse_args()
 
@@ -369,7 +520,8 @@ def main():
                         draw_contours=args.draw_contours,
                         save_svg_contour=args.save_svg_contour,
                         puzzle_width_inches=args.puzzle_width_inches,
-                        puzzle_height_inches=args.puzzle_height_inches
+                        puzzle_height_inches=args.puzzle_height_inches,
+                        missing_piece_color=args.missing_piece_color
                     )
                     print(f"Successfully processed '{subdir_name}'. Output saved to '{batch_output_path}'.")
                     processed_count += 1
@@ -401,7 +553,8 @@ def main():
                 draw_contours=args.draw_contours,
                 save_svg_contour=args.save_svg_contour,
                 puzzle_width_inches=args.puzzle_width_inches,
-                puzzle_height_inches=args.puzzle_height_inches
+                puzzle_height_inches=args.puzzle_height_inches,
+                missing_piece_color=args.missing_piece_color
             )
 
             if aligner.debug and args.show_matches:

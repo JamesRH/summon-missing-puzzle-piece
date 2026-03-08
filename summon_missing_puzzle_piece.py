@@ -6,12 +6,14 @@ import matplotlib.pyplot as plt
 import svgwrite # Added for SVG output
 import argparse # Added for CLI functionality
 import sys # Added for mocking sys.argv
+from puzzle_piece_classifier import load_classifier, score_contour
 
 class ImageAligner:
     """
     Library class for aligning images, isolating regions, and extracting composites.
     """
-    def __init__(self, debug=False, detector=None, matcher=None):
+    def __init__(self, debug=False, detector=None, matcher=None,
+                 puzzle_classifier=None, use_puzzle_classifier=True):
         self.debug = debug
 
         # Initialize detector: SIFT as default as it worked well in tests
@@ -25,6 +27,20 @@ class ImageAligner:
             self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False) # crossCheck=False for knnMatch with ratio test
         else:
             self.matcher = matcher
+
+        # Load puzzle-piece shape classifier for biased contour selection
+        if use_puzzle_classifier:
+            if puzzle_classifier is not None:
+                self.puzzle_classifier = puzzle_classifier
+            else:
+                self.puzzle_classifier = load_classifier()
+            if self.debug:
+                if self.puzzle_classifier is not None:
+                    print("Puzzle piece classifier loaded.")
+                else:
+                    print("Puzzle piece classifier not found. Using area-only contour selection.")
+        else:
+            self.puzzle_classifier = None
 
     def _find_white_region(self, img_bgra):
         """
@@ -46,7 +62,24 @@ class ImageAligner:
         if not contours:
             raise ValueError("Could not find any white area in the second image.")
 
-        largest_contour = max(contours, key=cv2.contourArea)
+        # Bias selection toward puzzle-piece-like shapes when the classifier is available
+        if self.puzzle_classifier is not None and len(contours) > 1:
+            max_area = max(cv2.contourArea(c) for c in contours)
+
+            def _score(c):
+                area = cv2.contourArea(c)
+                area_norm = area / max_area if max_area > 0 else 0.0
+                puzzle_prob = score_contour(c, self.puzzle_classifier)
+                # area_norm is the primary driver; puzzle_prob adds up to a 2x bias
+                return area_norm * (0.5 + puzzle_prob)
+
+            largest_contour = max(contours, key=_score)
+            if self.debug:
+                chosen_prob = score_contour(largest_contour, self.puzzle_classifier)
+                print(f"Selected contour: area={cv2.contourArea(largest_contour):.0f}, "
+                      f"puzzle_prob={chosen_prob:.3f}")
+        else:
+            largest_contour = max(contours, key=cv2.contourArea)
 
         clean_mask = np.zeros_like(white_mask)
         cv2.drawContours(clean_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
@@ -210,13 +243,67 @@ class ImageAligner:
             final_output = np.zeros((1, 1, 4), dtype=np.uint8) # Create a small transparent image if no crop region
             x, y, w, h = 0, 0, 1, 1 # Set dummy values for w, h in case of no coords
 
-        # --- SVG Contour Export ---
+        # --- SVG Contour Export placeholder: saved after DPI is computed below ---
+
+        # Change print size by munging dpi
+        # Get DPI information from original complete image
+        # Calculate DPI based on puzzle_width_inches/puzzle_height_inches if provided, else use original or default
+        pil_complete_image_info = Image.open(complete_image_path).info
+        dpi = pil_complete_image_info.get('dpi', (300, 300))
+        # Use dimensions of the uncropped image for accurate aspect ratio and DPI calculation
+        w_pixels, h_pixels = final_output_uncropped.shape[1], final_output_uncropped.shape[0]
+        current_aspect_ratio = w_pixels / h_pixels
+        # Calculate size in inches
+        current_width_inches = w_pixels / dpi[0]
+        current_height_inches = h_pixels / dpi[1]
+    
+            
+        if puzzle_width_inches is None and puzzle_height_inches is None:    
+            calculated_dpi = dpi
+            puzzle_width_inches = current_width_inches
+            puzzle_height_inches = current_height_inches
+            
+        elif puzzle_width_inches is not None and puzzle_height_inches is not None:
+            provided_aspect_ratio = puzzle_width_inches / puzzle_height_inches
+            # Allow for slight floating point inaccuracies
+            if not np.isclose(current_aspect_ratio, provided_aspect_ratio, atol=0.01):
+                raise ValueError(
+                    f"Provided print dimensions ({puzzle_width_inches}in x {puzzle_height_inches}in) "
+                    f"do not match the image's aspect ratio ({current_aspect_ratio:.2f}). "
+                    "Please provide only one dimension (width or height) or ensure aspect ratios match."
+                )
+            # If aspect ratios match, calculate DPI using width
+            target_dpi = w_pixels / puzzle_width_inches
+            calculated_dpi = (int(target_dpi), int(target_dpi))
+            if self.debug: print(f"Calculated DPI for {puzzle_width_inches}in x {puzzle_height_inches}in: {calculated_dpi[0]}")
+
+        elif puzzle_width_inches is not None:
+            target_dpi = w_pixels / puzzle_width_inches
+            calculated_dpi = (int(target_dpi), int(target_dpi))
+            puzzle_height_inches = current_height_inches * ( puzzle_width_inches / current_width_inches )
+            if self.debug: print(f"Calculated DPI for {puzzle_width_inches} inches width: {calculated_dpi[0]}")
+
+        elif puzzle_height_inches is not None:
+            target_dpi = h_pixels / puzzle_height_inches
+            calculated_dpi = (int(target_dpi), int(target_dpi))
+            puzzle_width_inches = current_width_inches * ( puzzle_height_inches / current_height_inches )
+            if self.debug: print(f"Calculated DPI for {puzzle_height_inches} inches height: {calculated_dpi[0]}")
+        else:
+            calculated_dpi=dpi if dpi is not None else (300, 300) # Fallback if error occurs, though should be caught
+
+
+        # --- SVG Contour Export (after DPI/inch calculation so physical dimensions are known) ---
         if save_svg_contour:
             svg_filename = os.path.splitext(output_path)[0] + "_contour.svg"
-            # Use explicit pixel units for size and correct (width, height) order
-            
-            dwg = svgwrite.Drawing(svg_filename, size=(f"{w}px", f"{h}px"), profile='tiny', 
-                                   height=puzzle_hight_inches+'in', width=puzzle_width_inches+'20in') # Use cropped dimensions
+            # Physical size of the cropped piece in inches
+            piece_width_inches = w / calculated_dpi[0]
+            piece_height_inches = h / calculated_dpi[1]
+            dwg = svgwrite.Drawing(
+                svg_filename,
+                size=(f"{piece_width_inches:.4f}in", f"{piece_height_inches:.4f}in"),
+                profile='tiny')
+            # Use pixel coordinates internally, mapped to the physical viewport
+            dwg.viewbox(0, 0, w, h)
 
             # Simplify the contour using approxPolyDP
             # We use the contours found above, which are already from aligned_white_mask and CHAIN_APPROX_NONE
@@ -239,53 +326,6 @@ class ImageAligner:
             dwg.save()
             if self.debug:
                 print(f"SVG contour saved to {svg_filename}")
-
-
-        # Change print size by munging dpi
-        # Get DPI information from original complete image
-        # Calculate DPI based on puzzle_width_inches/puzzle_height_inches if provided, else use original or default
-        pil_complete_image_info = Image.open(complete_image_path).info
-        dpi = pil_complete_image_info.get('dpi', (300, 300))
-        # Use dimensions of the uncropped image for accurate aspect ratio and DPI calculation
-        w_pixels, h_pixels = final_output_uncropped.shape[1], final_output_uncropped.shape[0]
-        current_aspect_ratio = w_pixels / h_pixels
-        # Calculate size in inches
-        current_width_inches = w_pixels / dpi[0]
-        current_height_inches = h_pixels / dpi[1]
-    
-            
-        if puzzle_width_inches is None and puzzle_height_inches is None:    
-            calculated_dpi = dpi
-            puzzle_width_inches = current_width_inches
-            puzzle_height_inches = current_height_in
-            
-        elif puzzle_width_inches is not None and puzzle_height_inches is not None:
-            provided_aspect_ratio = puzzle_width_inches / puzzle_height_inches
-            # Allow for slight floating point inaccuracies
-            if not np.isclose(current_aspect_ratio, provided_aspect_ratio, atol=0.01):
-                raise ValueError(
-                    f"Provided print dimensions ({puzzle_width_inches}in x {puzzle_height_inches}in) "
-                    f"do not match the image's aspect ratio ({current_aspect_ratio:.2f}). "
-                    "Please provide only one dimension (width or height) or ensure aspect ratios match."
-                )
-            # If aspect ratios match, calculate DPI using width
-            target_dpi = w_pixels / puzzle_width_inches
-            calculated_dpi = (int(target_dpi), int(target_dpi))
-            if self.debug: print(f"Calculated DPI for {puzzle_width_inches}in x {puzzle_height_inches}in: {calculated_dpi[0]}")
-
-        elif puzzle_width_inches is not None:
-            target_dpi = w_pixels / puzzle_width_inches
-            calculated_dpi = (int(target_dpi), int(target_dpi))
-            puzzle_hight_inches = current_hight_inches * ( puzzle_width_inches / current_width_inches ) 
-            if self.debug: print(f"Calculated DPI for {puzzle_width_inches} inches width: {calculated_dpi[0]}")
-
-        elif puzzle_height_inches is not None:
-            target_dpi = h_pixels / puzzle_height_inches
-            calculated_dpi = (int(target_dpi), int(target_dpi))
-            puzzle_width_inches = current_width_inches * ( puzzle_height_inches / current_height_inches )
-            if self.debug: print(f"Calculated DPI for {puzzle_height_inches} inches height: {calculated_dpi[0]}")
-        else:
-            calculated_dpi=dpi if dpi is not None else (300, 300) # Fallback if error occurs, though should be caught
 
 
         # Save the final output PNG
@@ -320,9 +360,12 @@ def main():
     parser.add_argument('--puzzle_width_inches', type=float, help='Desired piece scaling for width of the puzzle in inches. DPI will be calculated to match this width, preserving aspect ratio.')
     parser.add_argument('--puzzle_height_inches', type=float, help='Desired piece scaling for height of the puzzle in inches. DPI will be calculated to match this height, preserving aspect ratio.')
 
+    parser.add_argument('--no_puzzle_classifier', action='store_true', help='Disable the puzzle-piece shape classifier (use area-only contour selection).')
+
     args = parser.parse_args()
 
-    aligner = ImageAligner(debug=args.debug) # Pass debug argument to ImageAligner
+    aligner = ImageAligner(debug=args.debug,
+                           use_puzzle_classifier=not args.no_puzzle_classifier) # Pass debug argument to ImageAligner
 
     if args.batchdir:
         if not os.path.exists(args.batchdir):
